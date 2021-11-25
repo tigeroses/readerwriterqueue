@@ -32,7 +32,7 @@ public:
 
 public:
 	explicit BlockingReaderWriterCircularBuffer(std::size_t capacity)
-		: maxcap(capacity), mask(), rawData(), data(),
+		: maxcap(capacity), mask(), 
 		slots(new spsc_sema::LightweightSemaphore(static_cast<spsc_sema::LightweightSemaphore::ssize_t>(capacity))),
 		items(new spsc_sema::LightweightSemaphore(0)),
 		nextSlot(0), nextItem(0)
@@ -46,12 +46,12 @@ public:
 		for (std::size_t i = 1; i < sizeof(std::size_t); i <<= 1)
 			capacity |= capacity >> (i << 3);
 		mask = capacity++;
-		rawData = static_cast<char*>(std::malloc(capacity * sizeof(T) + std::alignment_of<T>::value - 1));
-		data = align_for<T>(rawData);
+		
+		data.resize(capacity);
 	}
 
 	BlockingReaderWriterCircularBuffer(BlockingReaderWriterCircularBuffer&& other)
-		: maxcap(0), mask(0), rawData(nullptr), data(nullptr),
+		: maxcap(0), mask(0), 
 		slots(new spsc_sema::LightweightSemaphore(0)),
 		items(new spsc_sema::LightweightSemaphore(0)),
 		nextSlot(), nextItem()
@@ -65,9 +65,9 @@ public:
 	// being deleted. It's up to the user to synchronize this.
 	~BlockingReaderWriterCircularBuffer()
 	{
-		for (std::size_t i = 0, n = items->availableApprox(); i != n; ++i)
-			reinterpret_cast<T*>(data)[(nextItem + i) & mask].~T();
-		std::free(rawData);
+		// for (std::size_t i = 0, n = items->availableApprox(); i != n; ++i)
+		// 	data[(nextItem + i) & mask].~T();
+		// std::free(rawData);
 	}
 
 	BlockingReaderWriterCircularBuffer& operator=(BlockingReaderWriterCircularBuffer&& other) noexcept
@@ -84,7 +84,6 @@ public:
 	{
 		std::swap(maxcap, other.maxcap);
 		std::swap(mask, other.mask);
-		std::swap(rawData, other.rawData);
 		std::swap(data, other.data);
 		std::swap(slots, other.slots);
 		std::swap(items, other.items);
@@ -121,6 +120,12 @@ public:
 	// Thread-safe when called by producer thread.
 	// No exception guarantee (state will be corrupted) if constructor of T throws.
 	void wait_enqueue(T const& item)
+	{
+		while (!slots->wait());
+		inner_enqueue(item);
+	}
+
+	void wait_enqueue(T & item)
 	{
 		while (!slots->wait());
 		inner_enqueue(item);
@@ -251,7 +256,15 @@ private:
 	void inner_enqueue(U&& item)
 	{
 		std::size_t i = nextSlot++;
-		new (reinterpret_cast<T*>(data) + (i & mask)) T(std::forward<U>(item));
+		data[(i & mask)] = item;
+		items->signal();
+	}
+
+	template<typename U>
+	void inner_enqueue(U& item)
+	{
+		std::size_t i = nextSlot++;
+		data[(i & mask)] = item;
 		items->signal();
 	}
 
@@ -259,24 +272,15 @@ private:
 	void inner_dequeue(U& item)
 	{
 		std::size_t i = nextItem++;
-		T& element = reinterpret_cast<T*>(data)[i & mask];
-		item = std::move(element);
-		element.~T();
+		item = data[(i & mask)];
 		slots->signal();
-	}
-
-	template<typename U>
-	static inline char* align_for(char* ptr)
-	{
-		const std::size_t alignment = std::alignment_of<U>::value;
-		return ptr + (alignment - (reinterpret_cast<std::uintptr_t>(ptr) % alignment)) % alignment;
 	}
 
 private:
 	std::size_t maxcap;                           // actual (non-power-of-two) capacity
 	std::size_t mask;                             // circular buffer capacity mask (for cheap modulo)
-	char* rawData;                                // raw circular buffer memory
-	char* data;                                   // circular buffer memory aligned to element alignment
+	
+	std::vector<value_type> data;                                   // circular buffer memory aligned to element alignment
 	std::unique_ptr<spsc_sema::LightweightSemaphore> slots;  // number of slots currently free
 	std::unique_ptr<spsc_sema::LightweightSemaphore> items;  // number of elements currently enqueued
 	char cachelineFiller0[MOODYCAMEL_CACHE_LINE_SIZE - sizeof(char*) * 2 - sizeof(std::size_t) * 2 - sizeof(std::unique_ptr<spsc_sema::LightweightSemaphore>) * 2];
